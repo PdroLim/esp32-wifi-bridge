@@ -1,168 +1,108 @@
 import network
 import uasyncio as asyncio
-from machine import UART, Pin, SPI
 import time
-import sys
 import config
+from machine import SPI, Pin
+from w5500 import W5500
 
-# ── Interface física ──────────────────────────────────────────
-class RS485:
-    def __init__(self):
-        self.uart = UART(config.UART_ID, baudrate=config.UART_BAUD,
-                         tx=config.UART_TX, rx=config.UART_RX,
-                         bits=config.UART_BITS, parity=config.UART_PARITY,
-                         stop=config.UART_STOP)
-        print(f"RS485 UART{config.UART_ID} TX={config.UART_TX} RX={config.UART_RX} {config.UART_BAUD}bps")
+nic = None
+_eth = None   # socket ativo (server ou conexão)
 
-    def any(self):
-        return self.uart.any()
+# ── Ethernet ─────────────────────────────────────────────────
+def eth_init():
+    global nic
+    spi = SPI(config.ETH_SPI_ID, baudrate=10_000_000,
+              sck=Pin(config.ETH_CLK), mosi=Pin(config.ETH_MOSI), miso=Pin(config.ETH_MISO))
+    cs  = Pin(config.ETH_CS,  Pin.OUT)
+    rst = Pin(config.ETH_RST, Pin.OUT)
+    nic = W5500(spi, cs, rst, mac=config.ETH_MAC)
+    nic.ifconfig(config.ETH_IP, config.ETH_MASK, config.ETH_GW)
+    for _ in range(100):
+        if nic.link_up():
+            print(f"ETH up: {config.ETH_IP}")
+            return
+        time.sleep_ms(100)
+    print("ETH: sem link (verifique o cabo)")
 
-    def read(self, n):
-        return self.uart.read(n)
-
-    def write(self, data):
-        self.uart.write(data)
-
-
-class EthernetW5500:
-    def __init__(self):
-        from machine import SPI, Pin
-        try:
-            import wiznet5k
-        except ImportError:
-            print("ERRO: driver wiznet5k nao encontrado.")
-            print("Execute: mpremote connect <port> mip install wiznet5k")
-            sys.exit(1)
-
-        spi = SPI(config.ETH_SPI_ID, baudrate=2_000_000,
-                  sck=Pin(config.ETH_CLK),
-                  mosi=Pin(config.ETH_MOSI),
-                  miso=Pin(config.ETH_MISO))
-        cs  = Pin(config.ETH_CS,  Pin.OUT)
-        rst = Pin(config.ETH_RST, Pin.OUT)
-
-        self.nic = wiznet5k.WIZNET5K(spi, cs, rst)
-        self.nic.ifconfig((config.ETH_IP, config.ETH_MASK, config.ETH_GW, "8.8.8.8"))
-        print(f"Ethernet W5500 IP={config.ETH_IP}")
-
-        # Servidor TCP interno para dispositivo externo
-        self._srv = self.nic.socket()
-        self._srv.bind(("", config.ETH_PORT))
-        self._srv.listen(1)
-        self._srv.settimeout(0)
-        self._conn = None
-        print(f"Ethernet aguardando conexao na porta {config.ETH_PORT}")
-
-    def _ensure_conn(self):
-        if self._conn is None:
-            try:
-                self._conn, addr = self._srv.accept()
-                self._conn.settimeout(0)
-                print(f"Ethernet: cliente conectado de {addr}")
-            except OSError:
-                pass
-
-    def any(self):
-        self._ensure_conn()
-        if self._conn is None:
-            return 0
-        try:
-            data = self._conn.recv(1)
-            if data:
-                self._buf = data + (self._buf if hasattr(self, "_buf") else b"")
-                return len(self._buf)
-        except OSError:
-            pass
-        return len(self._buf) if hasattr(self, "_buf") else 0
-
-    def read(self, n):
-        self._ensure_conn()
-        if self._conn is None:
-            return None
-        try:
-            data = self._conn.recv(n)
-            return data if data else None
-        except OSError:
-            self._conn = None
-            return None
-
-    def write(self, data):
-        self._ensure_conn()
-        if self._conn:
-            try:
-                self._conn.send(data)
-            except OSError:
-                self._conn = None
-
+def eth_open_server():
+    global _eth
+    if _eth:
+        try: _eth.close()
+        except: pass
+    _eth = nic.socket(0)
+    _eth.bind(config.ETH_PORT)
+    _eth.listen()
+    print(f"ETH aguardando em {config.ETH_IP}:{config.ETH_PORT}")
 
 # ── WiFi AP ───────────────────────────────────────────────────
-def setup_ap():
+def wifi_ap_start():
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
-    ap.config(ssid=config.WIFI_SSID, password=config.WIFI_PASS,
-              security=3, channel=config.WIFI_CHANNEL)
-    timeout = 10
-    while not ap.active() and timeout > 0:
-        time.sleep(0.5)
-        timeout -= 1
-    ip = ap.ifconfig()[0]
-    print(f"AP ativo: ssid={config.WIFI_SSID} ip={ip} porta={config.BRIDGE_PORT}")
-    return ip
+    ap.config(ssid=config.WIFI_SSID, password=config.WIFI_PASS, security=3, channel=6)
+    for _ in range(20):
+        if ap.active(): break
+        time.sleep_ms(500)
+    print(f"WiFi AP: {config.WIFI_SSID}  IP={ap.ifconfig()[0]}")
 
+# ── Bridge handler (uma conexão STA por vez) ──────────────────
+async def handle_bridge(wifi_r, wifi_w):
+    global _eth
+    peer = wifi_w.get_extra_info("peername")
+    print(f"STA conectou via WiFi: {peer}")
+    eth_up = False
 
-# ── Bridge task ───────────────────────────────────────────────
-phys = None
-
-async def handle_client(reader, writer):
-    addr = writer.get_extra_info("peername")
-    print(f"WiFi cliente conectado: {addr}")
     try:
         while True:
-            # WiFi → interface física
+            # Aguarda cliente ETH
+            if not eth_up:
+                if _eth.accept_ready():
+                    eth_up = True
+                    print("ETH: cliente conectou")
+                else:
+                    await asyncio.sleep_ms(50)
+                    continue
+
+            # ETH → WiFi
+            n = _eth.available()
+            if n:
+                chunk = _eth.recv(min(n, 512))
+                if chunk:
+                    wifi_w.write(chunk)
+                    await wifi_w.drain()
+
+            # WiFi → ETH
             try:
-                data = await asyncio.wait_for(reader.read(512), timeout=0.005)
-                if not data:
+                chunk = await asyncio.wait_for(wifi_r.read(512), timeout=0.005)
+                if not chunk:
                     break
-                phys.write(data)
+                _eth.send(chunk)
             except asyncio.TimeoutError:
                 pass
 
-            # Interface física → WiFi
-            n = phys.any()
-            if n:
-                data = phys.read(n)
-                if data:
-                    writer.write(data)
-                    await writer.drain()
+            # Verifica se ETH ainda está conectado
+            if not _eth.is_connected():
+                print("ETH: cliente desconectou")
+                eth_open_server()
+                eth_up = False
 
             await asyncio.sleep_ms(1)
+
     except Exception as e:
-        print(f"Conexao encerrada: {e}")
+        print(f"Bridge encerrada: {e}")
     finally:
         try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-    print("Cliente desconectado")
-
+            wifi_w.close()
+            await wifi_w.wait_closed()
+        except: pass
+        eth_open_server()
+    print("Aguardando nova conexão STA...")
 
 async def main():
-    global phys
-
-    # Inicializar interface física
-    if config.INTERFACE == "ETHERNET":
-        phys = EthernetW5500()
-    else:
-        phys = RS485()
-
-    # Inicializar WiFi AP
-    setup_ap()
-
-    # Servidor TCP para a placa STA
-    server = await asyncio.start_server(handle_client, "0.0.0.0", config.BRIDGE_PORT)
-    print("Ponte pronta. Aguardando placa STA...")
+    eth_init()
+    eth_open_server()
+    wifi_ap_start()
+    server = await asyncio.start_server(handle_bridge, "0.0.0.0", config.BRIDGE_PORT)
+    print("Pronto — aguardando STA WiFi e cliente ETH")
     await server.wait_closed()
-
 
 asyncio.run(main())
