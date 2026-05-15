@@ -36,19 +36,32 @@ def eth_open_server():
 
 # ── WiFi STA ──────────────────────────────────────────────────
 def wifi_connect():
+    # Garante que o modo AP está desligado antes de ativar STA
+    ap = network.WLAN(network.AP_IF)
+    if ap.active():
+        ap.active(False)
+        time.sleep_ms(300)
+
     sta = network.WLAN(network.STA_IF)
-    sta.active(True)
+    if not sta.active():
+        sta.active(True)
+        time.sleep_ms(300)
+
     if sta.isconnected():
         return True
+
     sta.connect(config.WIFI_SSID, config.WIFI_PASS)
     print(f"Conectando em {config.WIFI_SSID}", end="")
     for _ in range(30):
         if sta.isconnected():
-            print(f" OK → {sta.ifconfig()[0]}")
+            print(f" OK -> {sta.ifconfig()[0]}")
             return True
         time.sleep(1)
         print(".", end="")
     print(" FALHOU")
+    # Reinicia o WiFi para a próxima tentativa
+    sta.active(False)
+    time.sleep_ms(500)
     return False
 
 # ── Bridge ────────────────────────────────────────────────────
